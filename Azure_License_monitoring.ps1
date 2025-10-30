@@ -17,7 +17,7 @@
    .PERMISSIONS
     Microsoft Graph API:
         - Directory.Read.All
-    Azure Attribute Assignment Administrator role needed for security attributes (GA is not enough)
+    Azure Attribute Assignment Reader role needed for security attributes (GA is not enough)
 
   .LINK
     License plan SKUs: 
