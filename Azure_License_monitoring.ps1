@@ -1,51 +1,93 @@
-# Script:	Azure_license_monitoring.ps1
-# Purpose:	Monitor assigned Azure licenses and email if license count drop below threshold
-# Author:	Petri Nieminen 
-# Github:	https://github.com/ITSpecialistNieminen/Azure_License_monitoring.ps1.git
+ <#
+  .SYNOPSIS
+    Generates a Microsoft 365 license compliance report by combining Active Directory and Microsoft Graph data.
 
+  .DESCRIPTION
+    This script generates a Microsoft 365 license compliance report by retrieving user data 
+    from Microsoft Graph and local Active Directory. It maps selected license SKUs (such as E3, Visio, Copilot, etc.)
+    to users.
+
+    Results are exported to a CSV file with detailed license presence per user. The script logs key actions and errors, handles log rotation, 
+    and provides structured outputs for auditing and reporting.
+
+   .REQUIREMENTS
+        - PowerShell 5.1 or later
+        - Microsoft.Graph PowerShell SDK module
+
+   .PERMISSIONS
+    Microsoft Graph API:
+        - Directory.Read.All
+    Azure Attribute Assignment Administrator role needed for security attributes (GA is not enough)
+
+  .LINK
+    License plan SKUs: 
+    https://learn.microsoft.com/en-us/azure/active-directory/enterprise-users/licensing-service-plan-reference
+
+  .OUTPUTS
+    CSV file written to script directory with license and user details.
+    Log file stored in /logs subfolder for tracking execution history and issues.
+
+  .EXAMPLE
+    .\Export-LicenseReport.ps1
+    Runs the script and generates a license compliance CSV report.
+    
+    Authors:
+        petri.nieminen91@gmail.com
+#>
 
 ##### VARIABLES #####
 
 # User who run script
 $runas=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
-#$ScriptDirectory = split-path -parent $MyInvocation.MyCommand.Definition
-$ScriptDirectory = "C:\Monitoring\Azure"
+$ScriptDirectory = split-path -parent $MyInvocation.MyCommand.Definition
+$LogDirectory = Join-Path $ScriptDirectory "logs"
+
+# Check if the main folder exists
+if (-Not (Test-Path -Path $ScriptDirectory)) {
+    # Create the main folder
+    New-Item -ItemType Directory -Path $ScriptDirectory
+    Write-Host "Folder created: $ScriptDirectory"
+} else {
+    Write-Host "Folder already exists: $ScriptDirectory"
+}
+
+# Check if the 'logs' subfolder exists
+if (-Not (Test-Path -Path $LogDirectory)) {
+    # Create the 'logs' subfolder
+    New-Item -ItemType Directory -Path $LogDirectory
+    Write-Host "Subfolder 'logs' created: $LogDirectory"
+} else {
+    Write-Host "Subfolder 'logs' already exists: $LogDirectory"
+}
+
+$date = (Get-Date -Format 'yyyyMMdd')
 
 # Log file custom name
-$LogFileName = "O365_licenses.log"
+$LogFileName = "ReportAction.log"
 # Log filename based on date and label
-$LogFileNameFull = (Get-Date -Format yyyyMMdd) + "_" + $LogFileName
+$LogFileNameFull = $date + "_" + $LogFileName
 # Log file location
 $loglocation = "$ScriptDirectory\logs"
 $Logfile = (Join-Path $loglocation $LogFileNameFull)
-# Log retention policy (90 days)
-$LogRetention = 90
+# Log retention policy (days)
+$LogRetention = 180
 $logmaxage = (Get-Date).AddDays(-$LogRetention)
 
-$TenantLicenses = @()  # Initialize an empty array to store license information
+# ResultDir
+$File_cloud = "$ScriptDirectory\$($date)_Report.csv"
 
-# Specify the license SKU you want to check
-$licenseIds = "EMS", #Enterprise Mobility + Security E3
-"EMSPREMIUM", #Enterprise Mobility + Security E5
-"EXCHANGESTANDARD", #Exchange Online (Plan 1)
-"ENTERPRISEPACK", #Office 365 E3
-"STANDARDPACK", #Office 365 E1
-"SPE_E3", #Microsoft 365 E3
-"IDENTITY_THREAT_PROTECTION" #Microsoft 365 E5 Security
+# Build the list of properties to retrieve
+$propertiesToGet = "DisplayName,UserPrincipalName,AssignedLicenses,OnPremisesSyncEnabled,Id,userType,CompanyName"
 
-#Full list: https://learn.microsoft.com/en-us/azure/active-directory/enterprise-users/licensing-service-plan-reference
-
-# Email settings
-$from = ''
-$to = ''
-$bcc = ''
-$SmtpServer = ''
-
-# Azure login creds
-$TenantUname = ""
-$TenantPass = Get-Content -Path "$ScriptDirectory\Passwords\Azure_Monitoring_pwd.txt" | ConvertTo-SecureString
-$TenantCredentials = new-object -typename System.Management.Automation.PSCredential -argumentlist $TenantUname, $TenantPass
+# Initialize empty CSV file with header to ensure correct column order
+$HeaderObjectCloud = [PSCustomObject]@{
+    DisplayName          = ""
+    UserPrincipalName    = ""
+    UserID               = ""
+    UserType             = ""
+    CompanyName          = ""
+}
 
 ##### FUNCTIONS #####
 
@@ -74,149 +116,184 @@ Function Write-Log {
     }
 }
 
-# License function
-Function Get-Licenses {
-    param (
-        [Parameter(Mandatory = $true)]
-        [string]$LicenseId
+# Helper function
+function Test-LicensePresence {
+    param(
+        [string]$licenseKey,
+        [string]$upn
     )
-
-    # SKU to product name mapping table
-    $productNames = @{
-        "EMS" = "Enterprise Mobility + Security E3"
-        "EMSPREMIUM" = "Enterprise Mobility + Security E5"
-        "EXCHANGESTANDARD" = "Exchange Online (Plan 1)" 
-        "ENTERPRISEPACK" = "Office 365 E3"
-        "STANDARDPACK" = "Office 365 E1"
-        "SPE_E3" = "Microsoft 365 E3"
-        "IDENTITY_THREAT_PROTECTION" = "Microsoft 365 E5 Security"
-        # Add more mappings if needed
-    }
-
-    # Retrieve license information for the tenant
-    $TenantLicenses = Get-MsolAccountSku | Where-Object {$_.SkuPartNumber -eq $LicenseId} |
-        Select-Object -Property SkuPartNumber, ActiveUnits, ConsumedUnits |
-        ForEach-Object {
-            $unitsLeft = $_.ActiveUnits - $_.ConsumedUnits
-            [PSCustomObject]@{
-                SkuPartNumber = $_.SkuPartNumber
-                ProductName = $productNames[$_.SkuPartNumber]
-                ActiveUnits = $_.ActiveUnits
-                ConsumedUnits = $_.ConsumedUnits
-                UnitsLeft = $unitsLeft
-            }
-        }
-
-    # Return the license information
-    return $TenantLicenses
+    return $licenseHolders[$licenseKey] -contains $upn
 }
-
 
 ##### SCRIPT #####
 
+Write-Log -Level INFO "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<START>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+
 # Log rotate
 try {
-    Get-ChildItem $loglocation\*$LogFileName | Where-Object {$_.LastWriteTime -lt $logmaxage} -ErrorAction Stop | Remove-Item -ErrorAction Continue
+    $oldLogs = Get-ChildItem "$loglocation\*.log" | Where-Object { $_.LastWriteTime -lt $logmaxage }
+
+    if ($oldLogs.Count -gt 0) {
+        $oldLogs | Remove-Item -Force
+        Write-Log -Level INFO -Message "Deleted $($oldLogs.Count) log file(s) older than $LogRetention days."
+    } else {
+        Write-Log -Level INFO -Message "No log files older than $LogRetention days to clean up."
+    }
 }
 catch {
-    Write-Log -Level WARN -Message "Log rotate failed. Error:`r`n$_.Exception.Message"
+    Write-Log -Level WARN -Message "Log cleanup failed: $($_.Exception.Message)"
 }
 
-Write-Log -Level INFO "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<START>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
 Write-Log -Level INFO "Script run as $runas."
 
-#Check if MSOnline PowerShell module has been installed
-Try {
-    Write-Log -Level INFO "Checking if MSOnline PowerShell Module is Installed..."
-    $MSOnlineModule = Get-Module -ListAvailable "MSOnline"
- 
-    #Check if MSOnline  Module is installed
-    If(!$MSOnlineModule)
-    {
-        Write-Log -Level INFO "MSOnline Module not found" 
- 
-        #Check if script is executed under elevated user permissions - Run as Administrator
-        If (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator"))
-        {  
-            Write-Log -Level INFO "Please Run this script in elevated mode (Run as Administrator)! "
-            Exit
-        }
- 
-        Write-Log -Level INFO "Installing MSOnline PowerShell Module..."
-        Install-Module MSOnline -Force -Confirm:$False
-        Write-Log -Level INFO "MSOnline Module installed!"
-    }
-    Else
-    {
-        Write-Log -Level INFO "MSOnline Module found"
-        #sharepoint online powershell module import
-        Write-Log -Level INFO "Importing MSOnline PowerShell Module..."
-        Import-Module MSOnline
-        Write-Log -Level INFO "MSOnline Module imported successfully"
-    }
-}
-Catch{
-    Write-Log -Level ERROR "MSOnline Module Error:`r`n$($_.Exception.Message)"
-}
-
-# Set the security protocol to TLS 1.2
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# Connect to MSOnline service
 try {
-    Connect-MsolService  -Credential $TenantCredentials -ErrorAction Stop
-    Write-Log -Level INFO "Connection to MsolService established"
+    # Check if the Microsoft.Graph module is already installed
+    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
+        Write-Log -Level WARN "Microsoft.Graph module is not installed."
+    }
+
+    # Attempt to import the module
+    Import-Module Microsoft.Graph.Users -ErrorAction Stop
+    Write-Log -Level INFO "Microsoft.Graph.Subscription and Microsoft.Graph.Users module successfully imported."
 }
 catch {
-    Write-Log -Level ERROR -Message "Failed to connect to MSOnline service. Error:`r`n$($_.Exception.Message)"
+    Write-Log -Level FATAL "Failed to import Microsoft.Graph module. Error:`n$($_.Exception.Message)"
+    exit 1
+}
+
+# Connect to Microsoft Graph
+Write-Log -Level INFO -Message "Connecting to Microsoft Graph..."
+try {
+    Connect-MgGraph -ErrorAction Stop
+    Write-Log -Level INFO -Message "Connection to Microsoft Graph established."
+} catch {
+    Write-Log -Level FATAL -Message "Failed to connect to Microsoft Graph. Error: $($_.Exception.Message)"
     exit
 }
 
-foreach ($licenseId in $licenseIds) {
-    try 
-        {
-        $licenses = Get-Licenses -LicenseId $licenseId # Function call
-        $licensesUnitsLeft = $licenses.UnitsLeft
-        $licensesProductName = $licenses.ProductName
-        }
-    catch 
-        {
-        Write-Log -Level ERROR -Message "Failed to retrieve license information for SKU '$licenseId'. Error:`r`n$($_.Exception.Message)"
-        }
-        if ($licensesUnitsLeft -lt 3) {
-            try
-                {
-                Write-Log -Level WARN "There are only $licensesUnitsLeft units left on the license $licensesProductName."
-             
-                $date = Get-Date
-                $body = "Product $licensesProductName have only $licensesUnitsLeft licenses left."
-                $Subject = "Azure licenses monitoring: License count below threshold!."       
-                Send-MailMessage -Encoding 'UTF8' -From $from -To $to -Subject $Subject -Body $body -SmtpServer $SmtpServer -Bcc $bcc
-                Write-Log -Level INFO -Message "Email notification sent to: $to"
-                }
-            catch
-                {
-                Write-Log -Level ERROR -Message "Failed to send email. Error:`r`n$($_.Exception.Message)"
-                }
-        }
-        $TenantLicenses += $licenses  # Append license information to the array (include all unit information)
-}
- 
-Write-Log -Level INFO "Current status of licenses:"
-# Iterate over each license and write to the log file
-$TenantLicenses | ForEach-Object {
-    $line = "SkuPartNumber: $($_.SkuPartNumber), ProductName: $($_.ProductName), ActiveUnits: $($_.ActiveUnits), ConsumedUnits: $($_.ConsumedUnits), UnitsLeft: $($_.UnitsLeft)"
-    Write-Log -Level INFO -Message $line
-}
- 
-# Disconnect to MsolService
+# Retrieve all licensed users from Microsoft Graph
+Write-Log -Level INFO -Message "Retrieving Graph users with selected properties..."
 try {
-    [Microsoft.Online.Administration.Automation.ConnectMsolService]::ClearUserSessionState()
-    Write-Log -Level INFO "Connection to MsolService disconnected"
+    $GraphUsers = Get-MgUser -All -Filter "accountEnabled eq true" -Property $propertiesToGet
+    Write-Log -Level INFO "Retrieved licensed users from Microsoft Graph"
 }
 catch {
-    Write-Log -Level ERROR -Message "Failed to disconnect to MsolService. Error:`r`n$($_.Exception.Message)"
+    Write-Log -Level ERROR -Message "Failed to retrieve Microsoft Graph users. Error:`n$($_.Exception.Message)"
     exit
-} 
- 
-Write-Log -Level INFO "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<END>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+}
+
+
+# Build a map of SkuId → SkuPartNumber
+$skuMap = @{}
+try {
+    $subscribedSkus = Get-MgSubscribedSku
+    foreach ($sku in $subscribedSkus) {
+        if ($sku.SkuId -and $sku.SkuPartNumber) {
+            $skuMap[$sku.SkuId] = $sku.SkuPartNumber
+        }
+    }
+    Write-Log -Level INFO "Mapped SKU IDs to SKU part numbers"
+}
+catch {
+    Write-Log -Level ERROR -Message "Failed to retrieve or map subscribed SKUs. Error:`n$($_.Exception.Message)"
+    exit
+}
+
+# Build a hashtable of UPNs per license SKU part number
+$licenseSkuMap = @{
+    Visio                   = "VISIOCLIENT"                         # Visio Plan 2
+    Copilot                 = "MICROSOFT_365_COPILOT"               # Microsoft 365 Copilot
+    AudioConference         = "MCOMEETADV"                          # Microsoft 365 Audio Conferencing
+    TeamsEEA                = "MICROSOFT_TEAMS_EEA_NEW"             # Microsoft Teams EEA
+    E3                      = "SPE_E3"                               # Microsoft 365 E3
+    ATPEnterprise           = "ATP_ENTERPRISE"                      # Microsoft Defender for Office 365 (Plan 1)
+    E1                      = "STANDARDPACK"                        # Office 365 E1
+    O365NoTeams             = "O365_W/O TEAMS BUNDLE_M3"            # Microsoft 365 E3 EEA (no Teams)
+    CopilotStudioTrial      = "MICROSOFT_COPILOT_STUDIO_TRIAL"      # Microsoft Copilot Studio Viral Trial
+    PowerAutomateFree       = "FLOW_FREE"                           # Microsoft Power Automate Free
+    TeamsRoomsPro           = "MTR_PRO"                             # Microsoft Teams Rooms Pro
+    FabricFree              = "FABRIC_FREE"                         # Microsoft Fabric (Free)
+    PowerAppsDeveloper      = "POWERAPPS_DEV"                       # Microsoft Power Apps for Developer
+    PowerAppsPlan2Trial     = "POWERAPPS_VIRAL"                     # Microsoft Power Apps Plan 2 Trial
+    AppConnect              = "APP_CONNECT"                         # App Connect 
+    StreamTrial             = "STREAM_O365_E3_VIRAL"                # Microsoft Stream Trial
+    TeamsPremiumDept        = "TEAMS_PREMIUM_FOR_DEPARTMENTS"       # Teams Premium (for Departments)
+}
+#Full list: https://learn.microsoft.com/en-us/azure/active-directory/enterprise-users/licensing-service-plan-reference
+
+# Build a list of UPNs per SKU
+$licenseHolders = @{}
+foreach ($key in $licenseSkuMap.Keys) {
+    $licenseHolders[$key] = @()
+}
+
+try {
+    foreach ($user in $GraphUsers) {
+        foreach ($assigned in $user.AssignedLicenses) {
+            $skuId = $assigned.SkuId
+            if ($skuMap.ContainsKey($skuId)) {
+                $skuPart = $skuMap[$skuId]
+                foreach ($key in $licenseSkuMap.Keys) {
+                    if ($skuPart -eq $licenseSkuMap[$key]) {
+                        $licenseHolders[$key] += $user.UserPrincipalName
+                    }
+                }
+            }
+        }
+    }
+    Write-Log -Level INFO "Built license mapping for users"
+}
+catch {
+    Write-Log -Level ERROR -Message "Failed to map licenses to users. Error:`n$($_.Exception.Message)"
+    exit
+}
+
+# Prepare result file with headers
+try {
+    # Add license SKU keys as properties to header object BEFORE exporting
+    foreach ($key in $licenseSkuMap.Keys) {
+        $HeaderObjectCloud | Add-Member -NotePropertyName $key -NotePropertyValue ""
+    }
+
+    # Now write header to CSV file
+    $HeaderObjectCloud | Export-Csv -Path $File_cloud -NoTypeInformation -Encoding UTF8
+    }
+catch {
+    Write-Log -Level ERROR -Message "Failed to write header to file. Error:`n$($_.Exception.Message)"
+    exit
+}
+
+# Loop through cloud users and append license information
+try {
+    $cloudUsers = $GraphUsers #| Where-Object { $_.OnPremisesSyncEnabled -ne $true }
+
+    foreach ($user in $cloudUsers) {
+
+        # Build hashtable for the output object
+        $outputProps = @{
+            DisplayName          = $user.DisplayName
+            UserPrincipalName    = $user.UserPrincipalName
+            UserID               = $user.Id
+            UserType             = $user.UserType
+            CompanyName          = $user.CompanyName
+        }
+
+        # Add license presence info to output properties
+        foreach ($key in $licenseSkuMap.Keys) {
+            $outputProps[$key] = if (Test-LicensePresence -licenseKey $key -upn $user.UserPrincipalName) { $true } else { $false }
+        }
+
+        # Create PSCustomObject with all properties at once
+        $outputObject = [PSCustomObject]$outputProps
+
+        # Append the object to CSV
+        $outputObject | Export-Csv -Path $File_cloud -Append -NoTypeInformation -Encoding UTF8
+    }
+
+    Write-Log -Level INFO "Processed cloud-only users"
+}
+catch {
+    Write-Log -Level ERROR -Message "Error while processing cloud-only users. Error:`n$($_.Exception.Message)"
+    exit
+}
+Write-Log -Level INFO "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<END>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>" 
