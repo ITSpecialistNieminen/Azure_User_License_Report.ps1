@@ -154,7 +154,8 @@ try {
 
     # Attempt to import the module
     Import-Module Microsoft.Graph.Users -ErrorAction Stop
-    Write-Log -Level INFO "Microsoft.Graph.Subscription and Microsoft.Graph.Users module successfully imported."
+    Import-Module Microsoft.Graph.Identity.DirectoryManagement 
+    Write-Log -Level INFO "Microsoft.Graph.Identity.DirectoryManagement and Microsoft.Graph.Users module successfully imported."
 }
 catch {
     Write-Log -Level FATAL "Failed to import Microsoft.Graph module. Error:`n$($_.Exception.Message)"
