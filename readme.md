@@ -20,7 +20,7 @@ The report is exported to CSV, and execution details are logged with automatic l
 - Microsoft.Graph PowerShell SDK (at least Microsoft.Graph.Users module)
 - Microsoft Graph API permissions:
   - Directory.Read.All
-- Azure Attribute Assignment Administrator role needed for security attributes (GA is not enough)
+- Azure Attribute Assignment Reader role needed for security attributes (GA is not enough)
 
 ## Usage
 
