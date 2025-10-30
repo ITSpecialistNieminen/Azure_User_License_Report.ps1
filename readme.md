@@ -31,7 +31,7 @@ The report is exported to CSV, and execution details are logged with automatic l
 
 2. Folder structure (created automatically if missing):
     ```
-    C:\Machine\Scripts\Licensereport\
+    C:\Scripts\Licensereport\
     ├─ Export-LicenseReport.ps1
     ├─ logs\
     │  ├─ [date]_ReportAction.log
